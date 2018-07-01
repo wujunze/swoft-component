@@ -4,7 +4,7 @@ namespace Swoft\Log;
 
 use Monolog\Handler\AbstractProcessingHandler;
 use Swoft\App;
-
+use \InvalidArgumentException;
 /**
  * 日志文件输出器
  *
@@ -25,6 +25,41 @@ class FileHandler extends AbstractProcessingHandler
      * @var string 输入日志文件名称
      */
     protected $logFile = "";
+
+    /**
+     * @var int  The maximal amount of files to keep (0 means unlimited)
+     */
+    protected $maxFiles =  5;
+
+    protected $mustRotate;
+
+    protected $nextRotation;
+
+    protected $filenameFormat;
+
+    protected $dateFormat;
+
+    /**
+     * @param string   $filename
+     * @param int      $maxFiles       The maximal amount of files to keep (0 means unlimited)
+     * @param int      $level          The minimum logging level at which this handler will be triggered
+     * @param Boolean  $bubble         Whether the messages that are handled can bubble up the stack or not
+     * @param int|null $filePermission Optional file permissions (default (0644) are only for owner read/write)
+     * @param Boolean  $useLocking     Try to lock log file before doing any writes
+     *
+     * @throws
+     */
+    public function __construct($filename, $maxFiles = 0, $level = Logger::DEBUG, $bubble = true, $filePermission = null, $useLocking = false)
+    {
+        $this->logFile = $filename;
+        $this->maxFiles = (int) $maxFiles;
+        $this->nextRotation = new \DateTimeImmutable('tomorrow');
+        $this->filenameFormat = '{filename}-{date}';
+        $this->dateFormat = 'Y-m-d';
+
+        parent::__construct($level, $bubble);
+    }
+
 
 
     /**
@@ -53,8 +88,20 @@ class FileHandler extends AbstractProcessingHandler
      */
     protected function write(array $records)
     {
+
+        // on the first record written, if the log is new, we should rotate (once per day)
+        if (null === $this->mustRotate) {
+            $this->mustRotate = !file_exists($this->logFile);
+        }
+
+        if ($this->nextRotation < $records['datetime']) {
+            $this->mustRotate = true;
+            $this->close();
+        }
+
+
         // 参数
-        $this->createDir();
+        //$this->createDir();
         $isTask = App::isWorkerStatus();
         $logFile = App::getAlias($this->logFile);
         $messageText = implode("\n", $records) . "\n";
@@ -64,7 +111,7 @@ class FileHandler extends AbstractProcessingHandler
             return $this->syncWrite($logFile, $messageText);
         }
         // 异步写
-        $this->aysncWrite($logFile, $messageText);
+        $this->asyncWrite($logFile, $messageText);
     }
 
     /**
@@ -91,7 +138,7 @@ class FileHandler extends AbstractProcessingHandler
      * @param string $logFile     日志路径
      * @param string $messageText 文本信息
      */
-    private function aysncWrite(string $logFile, string $messageText)
+    private function asyncWrite(string $logFile, string $messageText)
     {
         while (true) {
             $result = \Swoole\Async::writeFile($logFile, $messageText, null, FILE_APPEND);
@@ -127,20 +174,7 @@ class FileHandler extends AbstractProcessingHandler
         return $messages;
     }
 
-    /**
-     * 创建目录
-     */
-    private function createDir()
-    {
-        $logFile = App::getAlias($this->logFile);
-        $dir = dirname($logFile);
-        if ($dir !== null && !is_dir($dir)) {
-            $status = mkdir($dir, 0777, true);
-            if ($status === false) {
-                throw new \UnexpectedValueException(sprintf('There is no existing directory at "%s" and its not buildable: ', $dir));
-            }
-        }
-    }
+
 
     /**
      * check是否输出日志
@@ -157,4 +191,107 @@ class FileHandler extends AbstractProcessingHandler
 
         return in_array($record['level'], $this->levels);
     }
+
+    /**
+     * Rotates the files.
+     */
+    protected function rotate()
+    {
+        // update filename
+        $this->logFile = $this->getTimedFilename();
+        $this->nextRotation = new \DateTimeImmutable('tomorrow');
+
+        // skip GC of old logs if files are unlimited
+        if (0 === $this->maxFiles) {
+            return;
+        }
+
+        $logFiles = glob($this->getGlobPattern());
+        if ($this->maxFiles >= count($logFiles)) {
+            // no files to remove
+            return;
+        }
+
+        // Sorting the files by name to remove the older ones
+        usort($logFiles, function ($a, $b) {
+            return strcmp($b, $a);
+        });
+
+        foreach (array_slice($logFiles, $this->maxFiles) as $file) {
+            if (is_writable($file)) {
+                // suppress errors here as unlink() might fail if two processes
+                // are cleaning up/rotating at the same time
+                set_error_handler(function ($errno, $errstr, $errfile, $errline) {
+                });
+                unlink($file);
+                restore_error_handler();
+            }
+        }
+
+        $this->mustRotate = false;
+    }
+
+    protected function getTimedFilename()
+    {
+        $fileInfo = pathinfo($this->logFile);
+        $timedFilename = str_replace(
+            ['{filename}', '{date}'],
+            [$fileInfo['filename'], date($this->dateFormat)],
+            $fileInfo['dirname'] . '/' . $this->filenameFormat
+        );
+
+        if (!empty($fileInfo['extension'])) {
+            $timedFilename .= '.'.$fileInfo['extension'];
+        }
+
+        return $timedFilename;
+    }
+
+    protected function getGlobPattern()
+    {
+        $fileInfo = pathinfo($this->logFile);
+        $glob = str_replace(
+            ['{filename}', '{date}'],
+            [$fileInfo['filename'], '*'],
+            $fileInfo['dirname'] . '/' . $this->filenameFormat
+        );
+        if (!empty($fileInfo['extension'])) {
+            $glob .= '.'.$fileInfo['extension'];
+        }
+
+        return $glob;
+    }
+
+
+    public function close()
+    {
+        parent::close();
+
+        if (true === $this->mustRotate) {
+            $this->rotate();
+        }
+    }
+
+    public function setFilenameFormat($filenameFormat, $dateFormat)
+    {
+        if (!preg_match('{^Y(([/_.-]?m)([/_.-]?d)?)?$}', $dateFormat)) {
+            throw new InvalidArgumentException(
+                'Invalid date format - format must be one of '.
+                'RotatingFileHandler::FILE_PER_DAY ("Y-m-d"), RotatingFileHandler::FILE_PER_MONTH ("Y-m") '.
+                'or RotatingFileHandler::FILE_PER_YEAR ("Y"), or you can set one of the '.
+                'date formats using slashes, underscores and/or dots instead of dashes.'
+            );
+        }
+        if (substr_count($filenameFormat, '{date}') === 0) {
+            throw new InvalidArgumentException(
+                'Invalid filename format - format must contain at least `{date}`, because otherwise rotating is impossible.'
+            );
+        }
+        $this->filenameFormat = $filenameFormat;
+        $this->dateFormat = $dateFormat;
+        $this->logFile = $this->getTimedFilename();
+        $this->logFile = $this->getTimedFilename();
+        $this->close();
+    }
+
 }
